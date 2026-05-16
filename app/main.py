@@ -75,7 +75,6 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 @app.post("/upload-dicom", tags=["Анализ снимков"])
 async def upload_dicom(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
-        # Создаем уникальное имя
         unique_prefix = str(uuid.uuid4())[:8]
         unique_filename = f"{unique_prefix}_{file.filename}"
         file_path = os.path.join(UPLOAD_DIR, unique_filename)
@@ -83,14 +82,13 @@ async def upload_dicom(file: UploadFile = File(...), db: Session = Depends(get_d
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
 
-        # Чтение DICOM
         ds = pydicom.dcmread(file_path)
         patient_id = f"ANON_{ds.get('PatientID', 'Unknown')}"
         spacing = [float(s) for s in ds.get("PixelSpacing", [1.0, 1.0])]
 
         # --- РАБОТА ИИ ---
         pixel_array = ds.pixel_array
-        # Нормализация и перевод в 3 канала (RGB), так как этого требуют веса .pth
+        # Нормализация
         pixel_array_norm = (pixel_array - np.min(pixel_array)) / (np.max(pixel_array) - np.min(pixel_array) + 1e-7)
         pixel_array_uint8 = (pixel_array_norm * 255).astype(np.uint8)
         
@@ -99,45 +97,42 @@ async def upload_dicom(file: UploadFile = File(...), db: Session = Depends(get_d
 
         with torch.no_grad():
             output = model(input_tensor)
-            # Получаем маску уверенности
             prob_mask = torch.sigmoid(output).squeeze().numpy()
-            mask = prob_mask > 0.5 # Порог 50%
+            mask = prob_mask > 0.5 
 
-        # Поиск границ опухоли на маске
+        # --- ВИЗУАЛИЗАЦИЯ И ПОДГОТОВКА 256x256 ---
+        # Сначала сжимаем картинку до 256x256, как просили
+        final_image = img_for_ai.resize((256, 256))
+        
         coords = np.argwhere(mask)
         if coords.size > 0:
+            # Здесь координаты уже в масштабе 256x256, ничего умножать не надо!
             y0, x0 = coords.min(axis=0)
             y1, x1 = coords.max(axis=0)
-            
-            # Масштабируем координаты обратно под оригинал
-            orig_h, orig_w = pixel_array.shape
-            x0, x1 = int(x0 * orig_w / 256), int(x1 * orig_w / 256)
-            y0, y1 = int(y0 * orig_h / 256), int(y1 * orig_h / 256)
 
             prediction = "Обнаружено новообразование"
             confidence = float(round(np.max(prob_mask) * 100, 2))
-            tumor_size_text = f"{round((x1-x0)*spacing[1], 1)} x {round((y1-y0)*spacing[0], 1)} мм"
-            is_tumor = True
+            
+            # Расчет в мм делаем с учетом оригинального размера, чтобы точность не упала
+            orig_h, orig_w = pixel_array.shape
+            real_w_mm = (x1 - x0) * (orig_w / 256) * spacing[1]
+            real_h_mm = (y1 - y0) * (orig_h / 256) * spacing[0]
+            tumor_size_text = f"{round(real_w_mm, 1)} x {round(real_h_mm, 1)} мм"
+            
+            # Рисуем рамку на сжатой картинке
+            draw = ImageDraw.Draw(final_image)
+            draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
+            draw.text((x0, y0-12), f"AI: {confidence}%", fill="red")
         else:
             prediction = "Патологий не выявлено"
             confidence = 0.0
             tumor_size_text = "—"
-            is_tumor = False
 
-        # --- ВИЗУАЛИЗАЦИЯ (Отрисовка маски) ---
-        rescaled = (np.maximum(pixel_array, 0) / np.max(pixel_array) * 255).astype(np.uint8)
-        final_image = Image.fromarray(rescaled).convert("RGB")
-        
-        if is_tumor:
-            draw = ImageDraw.Draw(final_image)
-            draw.rectangle([x0, y0, x1, y1], outline="red", width=3)
-            draw.text((x0, y0-15), f"AI: {confidence}%", fill="red")
-
+        # Сохраняем уже сжатую картинку 256x256
         preview_filename = f"preview_{unique_filename}.png"
         preview_path = os.path.join(UPLOAD_DIR, preview_filename)
         final_image.save(preview_path)
 
-        # Сохранение в БД
         new_record = AnalysisRecord(
             patient_id=patient_id, filename=unique_filename,
             preview_path=preview_path, prediction=prediction, 
