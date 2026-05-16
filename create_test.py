@@ -52,4 +52,3 @@ def create_dummy_dicom(filename="test.dcm"):
 if __name__ == "__main__":
     create_dummy_dicom()
     
-     ХУЙ
