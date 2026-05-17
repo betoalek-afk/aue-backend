@@ -2,7 +2,7 @@ from waitress import serve
 from a2wsgi import ASGIMiddleware
 from app.main import app
 
-# Этот "мостик" позволяет Waitress работать с FastAPI
+# Мостик для запуска FastAPI через WSGI сервер Waitress
 wsgi_app = ASGIMiddleware(app)
 
 if __name__ == "__main__":
