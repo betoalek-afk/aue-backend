@@ -12,7 +12,7 @@ def double_conv(in_channels, out_channels):
     )
 
 class UNet(nn.Module):
-    def __init__(self, n_channels=1, n_classes=1):
+    def __init__(self, n_channels=3, n_classes=1):
         super(UNet, self).__init__()
 
         self.inc = double_conv(n_channels, 64)
