@@ -1,10 +1,12 @@
 import os
+import sys
 import uuid
 import datetime
 from datetime import timezone
 import torch
 import torch.nn as nn
 import pydicom
+from pydicom.pixel_data_handlers.util import apply_voi_lut
 import numpy as np
 import cv2
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
@@ -14,7 +16,20 @@ from sqlalchemy.orm import Session, declarative_base
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker
 
-# --- 1. БАЗА ДАННЫХ ---
+# Настройка путей, чтобы Python видел папку ml
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# --- 1. ОЧИСТКА ---
+def soft_clean(probs):
+    mask = (probs > 0.3).astype(np.uint8) * 255
+    if mask.max() == 0:
+        return mask
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+# --- 2. БАЗА ---
 DATABASE_URL = "sqlite:///./medical_data.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -31,89 +46,79 @@ class AnalysisRecord(Base):
 Base.metadata.create_all(bind=engine)
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try:
+        yield db
+    finally:
+        db.close()
 
-# --- 2. ПРИЛОЖЕНИЕ ---
-app = FastAPI(title="AI Medical API - Production Ready")
+# --- 3. ПРИЛОЖЕНИЕ ---
+app = FastAPI(title="AI Medical System - Final Fix")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# --- 3. ИНИЦИАЛИЗАЦИЯ ИИ-МОДЕЛИ ---
-from app.ml.unet_model import UNet # Импорт твоего класса из unet_model.py
+# --- 4. МОДЕЛЬ ---
+from app.ml.unet_model import UNet 
 
 device = torch.device("cpu")
-model = UNet(n_channels=3, n_classes=1) # Теперь n_channels=3 по умолчанию
-model_path = "app/ml/best_model.pth"
+model = UNet(n_channels=3, n_classes=1).to(device)
+model_path = os.path.join(os.path.dirname(__file__), "ml", "best_model.pth")
 
 if os.path.exists(model_path):
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
-        print("✅ [AI-SYSTEM] Модель синхронизирована (3 канала)!")
+        print("✅ [AI-SYSTEM] Модель загружена!")
     except Exception as e:
-        print(f"❌ [CRITICAL] Ошибка весов: {e}")
+        print(f"❌ [ERROR] Ошибка весов: {e}")
 
-# --- 4. ЭНДПОИНТ ОБРАБОТКИ ---
+# --- 5. ЭНДПОИНТ ---
 
 @app.post("/upload-dicom")
 async def upload_dicom(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
         unique_id = str(uuid.uuid4())
-        
-        # Шаг 1: Сохранение исходного DICOM
         dicom_path = os.path.join(UPLOAD_DIR, f"{unique_id}.dcm")
         with open(dicom_path, "wb") as b:
             b.write(await file.read())
 
-        # Шаг 2: Обработка снимка через OpenCV
+        # Обработка DICOM
         ds = pydicom.dcmread(dicom_path)
-        img = ds.pixel_array.astype(float)
-        
-        # Нормализация 0-255
+        img = apply_voi_lut(ds.pixel_array, ds)
         img = (img - img.min()) / (img.max() - img.min() + 1e-5) * 255.0
         img_uint8 = np.uint8(img)
 
-        # "Умная" проверка каналов (исправление ошибки cvtColor)
         if len(img_uint8.shape) == 2:
-            # Если снимок ЧБ, делаем из него 3 канала
             img_rgb = cv2.cvtColor(img_uint8, cv2.COLOR_GRAY2RGB)
         else:
-            # Если уже 3 канала, берем как есть
             img_rgb = img_uint8[:, :, :3]
-
+            
         img_res = cv2.resize(img_rgb, (256, 256))
         
-        # Сохраняем оригинал как JPG (врачу для просмотра)
         orig_name = f"{unique_id}_original.jpg"
         cv2.imwrite(os.path.join(UPLOAD_DIR, orig_name), cv2.cvtColor(img_res, cv2.COLOR_RGB2BGR))
 
-        # Шаг 3: Инференс (как в твоем test_ai.py)
-        # Переводим в тензор, меняем оси (HWC -> CHW) и нормируем на 255
+        # Инференс
         input_tensor = torch.from_numpy(img_res).permute(2, 0, 1).float().unsqueeze(0) / 255.0
         
-        mask_name = "no_mask.png"
-        confidence = 0.0
-
         with torch.no_grad():
             output = model(input_tensor.to(device))
-            # Обработка вывода (если вдруг модель вернет кортеж)
             if isinstance(output, (tuple, list)): output = output[0]
             
-            probs = torch.sigmoid(output).cpu().numpy()[0][0]
-            confidence = float(probs.max())
+            probs = torch.sigmoid(output).squeeze().cpu().numpy()
+            max_conf = float(probs.max())
             
-            # Бинаризация маски
-            mask_data = (probs > 0.5).astype(np.uint8) * 255
+            mask_data = soft_clean(probs)
+            if mask_data.max() == 0:
+                mask_data = (probs > 0.2).astype(np.uint8) * 255
 
-        # Шаг 4: Сохранение маски как отдельный PNG
+        # Сохранение маски
         mask_name = f"{unique_id}_mask.png"
         cv2.imwrite(os.path.join(UPLOAD_DIR, mask_name), mask_data)
 
-        # Шаг 5: Запись в базу данных
+        # Запись в базу
         new_rec = AnalysisRecord(
             filename=file.filename,
             original_path=f"/uploads/{orig_name}",
@@ -122,11 +127,11 @@ async def upload_dicom(file: UploadFile = File(...), db: Session = Depends(get_d
         db.add(new_rec)
         db.commit()
 
-        print(f"--- [RESULT] Confidence: {confidence:.4f} ---")
+        print(f"--- [AI RESULT] Confidence: {max_conf:.4f} ---")
 
         return {
             "status": "success",
-            "confidence": round(confidence, 4),
+            "confidence": round(max_conf, 4),
             "original_image_url": f"http://127.0.0.1:8000/uploads/{orig_name}",
             "ai_mask_url": f"http://127.0.0.1:8000/uploads/{mask_name}"
         }
@@ -137,5 +142,5 @@ async def upload_dicom(file: UploadFile = File(...), db: Session = Depends(get_d
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
-def status():
-    return {"message": "AI Medical System is Ready", "model": "Loaded (3ch)"}
+def health():
+    return {"status": "online"}
